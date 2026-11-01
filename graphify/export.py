@@ -15,7 +15,7 @@ import networkx as nx
 from networkx.readwrite import json_graph
 from graphify.security import sanitize_label
 from graphify.analyze import _node_community_map
-from graphify.build import edge_data
+from graphify.build import edge_datas, has_parallel_links
 from graphify.paths import (
     os_replace_with_fallback,
     stem_filename_budget,
@@ -75,18 +75,25 @@ def backup_if_protected(out_dir: Path) -> "Path | None":
     backup_dir = out / today
     graph_src = out / "graph.json"
 
-    # Skip re-copying if today's backup already has identical graph.json content.
-    # If content differs (graph changed since the last backup today), overwrite
-    # the backup in place — one folder per day, always the latest pre-overwrite state.
-    if backup_dir.exists() and (backup_dir / "graph.json").exists():
-        src_hash = hashlib.sha256(graph_src.read_bytes()).hexdigest()
-        bak_hash = hashlib.sha256((backup_dir / "graph.json").read_bytes()).hexdigest()
-        if src_hash == bak_hash:
-            return backup_dir  # identical content, nothing to do
-
     try:
+        # Skip re-copying if today's backup already holds every artifact with an
+        # identical graph.json. graph.json alone is not proof of completeness: a
+        # snapshot missing a sidecar (an earlier copy attempt failed part-way)
+        # must fall through and retry the copy instead of reporting itself
+        # complete forever (#3769). If content differs, overwrite the backup in
+        # place — one folder per day, always the latest pre-overwrite state.
+        if backup_dir.exists() and (backup_dir / "graph.json").exists():
+            src_hash = hashlib.sha256(graph_src.read_bytes()).hexdigest()
+            bak_hash = hashlib.sha256((backup_dir / "graph.json").read_bytes()).hexdigest()
+            if src_hash == bak_hash and all(
+                (backup_dir / name).exists()
+                for name in _BACKUP_ARTIFACTS
+                if (out / name).exists()
+            ):
+                return backup_dir  # identical content, nothing to do
         backup_dir.mkdir(parents=True, exist_ok=True)
         copied = 0
+        failed: list[str] = []
         for name in _BACKUP_ARTIFACTS:
             src = out / name
             if src.exists():
@@ -94,12 +101,21 @@ def backup_if_protected(out_dir: Path) -> "Path | None":
                     shutil.copy2(src, backup_dir / name)
                     copied += 1
                 except Exception:
-                    pass
+                    failed.append(name)
+        if failed:
+            # A partial snapshot reported as a successful backup lets a stale
+            # graph.json survive the next overwrite unnoticed (#3769). Best-effort
+            # is unchanged: warn, report no backup, do not block the write.
+            print(
+                f"[graphify] warning: backup incomplete - could not copy "
+                f"{', '.join(failed)} -> {backup_dir.name}/ - continuing with overwrite",
+                file=sys.stderr,
+            )
+            return None
         if copied:
             print(f"[graphify] backed up {reason} graph ({copied} files) -> {backup_dir.name}/")
         return backup_dir
     except Exception as exc:
-        import sys
         print(f"[graphify] warning: backup failed ({exc}) - continuing with overwrite", file=sys.stderr)
         return None
 
@@ -226,7 +242,8 @@ def _git_head(cwd: "str | Path | None" = None) -> str | None:
     import subprocess as _sp
     try:
         r = _sp.run(
-            ["git", "rev-parse", "HEAD"], capture_output=True, text=True, timeout=3,
+            ["git", "rev-parse", "HEAD"], stdin=_sp.DEVNULL,
+            capture_output=True, text=True, timeout=3,
             cwd=str(cwd) if cwd is not None else None,
         )
         return r.stdout.strip() if r.returncode == 0 else None
@@ -310,10 +327,14 @@ def to_json(G: nx.Graph, communities: dict[int, list[str]], output_path: str, *,
                 # Empty/whitespace existing file (e.g. a freshly touched path):
                 # no nodes to lose, so any new graph is a growth — proceed.
                 existing_n = 0
+                existing_nodes = []
             else:
                 try:
                     existing_data = json.loads(raw)
-                    existing_n = len(existing_data.get("nodes", []))
+                    existing_nodes = existing_data.get("nodes", [])
+                    if not isinstance(existing_nodes, list):
+                        existing_nodes = []
+                    existing_n = len(existing_nodes)
                 except Exception as exc:
                     # Non-empty but unparseable existing graph (corrupt or a
                     # mid-write): we cannot verify the new graph is not a silent
@@ -330,7 +351,28 @@ def to_json(G: nx.Graph, communities: dict[int, list[str]], output_path: str, *,
                     )
                     return False
             new_n = G.number_of_nodes()
-            if new_n < existing_n:
+            from graphify.build import _lost_saved_semantic_nodes
+            new_node_list = [
+                {"id": node_id, **{key: value for key, value in attrs.items() if key != "id"}}
+                for node_id, attrs in G.nodes(data=True)
+            ]
+            folded: dict[str, str] = {}
+            missing = _lost_saved_semantic_nodes(existing_nodes, new_node_list, set(), folded)
+            if missing:
+                import sys as _sys
+                ids = ", ".join(str(node.get("id")) for node in missing)
+                print(
+                    "[graphify] WARNING: Refusing to overwrite — saved semantic "
+                    f"node(s) are missing from the new graph: {ids}.",
+                    file=_sys.stderr,
+                )
+                return False
+            # A saved semantic node merged into an AST twin that was already
+            # saved is one node, not two; a reload-and-recluster folds it (#4389).
+            # A twin new to this run does not offset some other node's loss.
+            existing_ids = {n.get("id") for n in existing_nodes if isinstance(n, dict)}
+            merged = sum(twin in existing_ids for twin in folded.values())
+            if new_n < existing_n - merged:
                 import sys as _sys
                 print(
                     f"[graphify] WARNING: new graph has {new_n} nodes but existing "
@@ -384,6 +426,11 @@ def to_json(G: nx.Graph, communities: dict[int, list[str]], output_path: str, *,
             if isinstance(link, dict)
             and link.get("source") in node_ids and link.get("target") in node_ids
         ]
+        # The flag above was derived from the in-memory simple graph, but the
+        # restored links may hold parallel edges (#3999); keep the serialized
+        # metadata consistent with the links or readers collapse them (#4500).
+        if has_parallel_links(data["links"], directed=bool(data.get("directed", True))):
+            data["multigraph"] = True
     for link in data["links"]:
         if "confidence_score" not in link:
             conf = link.get("confidence", "EXTRACTED")
@@ -460,7 +507,7 @@ def to_json(G: nx.Graph, communities: dict[int, list[str]], output_path: str, *,
         data["built_at_commit"] = commit
     from graphify.paths import write_json_atomic
     # Atomic write: a crash/ENOSPC mid-write must not truncate a good graph.json.
-    write_json_atomic(output_path, data, indent=2)
+    write_json_atomic(output_path, data, compact=True)
     return True
 
 
@@ -533,7 +580,7 @@ def to_cypher(G: nx.Graph, output_path: str) -> None:
             (data.get("file_type", "unknown") or "unknown").capitalize(),
             "Entity",
         )
-        lines.append(f"MERGE (n:{ftype} {{id: '{node_id_esc}', label: '{label}'}});")
+        lines.append(f"MERGE (n:{ftype} {{id: '{node_id_esc}'}}) SET n.label = '{label}';")
     lines.append("")
     for u, v, data in G.edges(data=True):
         u, v = data.get("_src", u), data.get("_tgt", v)
@@ -834,9 +881,9 @@ def to_obsidian(
 
         # Build tags for this node
         ftype = data.get("file_type", "")
-        ftype_tag = _FTYPE_TAG.get(ftype, f"graphify/{ftype}" if ftype else "graphify/document")
+        ftype_tag = _FTYPE_TAG.get(ftype, f"graphify/{_obsidian_tag(ftype)}" if ftype else "graphify/document")
         dom_conf = _dominant_confidence(node_id)
-        conf_tag = f"graphify/{dom_conf}"
+        conf_tag = f"graphify/{_obsidian_tag(dom_conf)}"
         comm_tag = f"community/{_obsidian_tag(community_name)}"
         node_tags = [ftype_tag, conf_tag, comm_tag]
 
@@ -864,11 +911,20 @@ def to_obsidian(
         if neighbors:
             lines.append("## Connections")
             for neighbor in sorted(neighbors, key=lambda n: G.nodes[n].get("label", n)):
-                edata = edge_data(G, node_id, neighbor)
                 neighbor_label = node_filename[neighbor]
-                relation = edata.get("relation", "")
-                confidence = edata.get("confidence", "EXTRACTED")
-                lines.append(f"- [[{neighbor_label}]] - `{relation}` [{confidence}]")
+                # One bullet per parallel edge, not per neighbour: graph.json is
+                # reloaded as a MultiGraph when it carries parallel edges
+                # (#4500), and `edge_data()` returns only the FIRST of them — so
+                # a pair joined by both `imports` and `calls` lost one relation
+                # from the note. Sorted so the note is byte-stable regardless of
+                # the order the parallel edges were inserted in.
+                for edata in sorted(
+                    edge_datas(G, node_id, neighbor),
+                    key=lambda d: (str(d.get("relation", "")), str(d.get("confidence", "EXTRACTED"))),
+                ):
+                    relation = edata.get("relation", "")
+                    confidence = edata.get("confidence", "EXTRACTED")
+                    lines.append(f"- [[{neighbor_label}]] - `{relation}` [{confidence}]")
             lines.append("")
 
         # Inline tags at bottom of note body (for Obsidian tag panel)
@@ -1321,9 +1377,12 @@ def to_graphml(
     for node_id in H.nodes():
         for key, val in list(H.nodes[node_id].items()):
             H.nodes[node_id][key] = _graphml_safe(val)
-    for u, v in H.edges():
-        for key, val in list(H.edges[u, v].items()):
-            H.edges[u, v][key] = _graphml_safe(val)
+    # edges(data=True) rather than H.edges[u, v]: graph.json is loaded as a
+    # MultiGraph when it carries parallel edges (#4500), and a MultiGraph edge
+    # view needs a key, so the (u, v) form crashed the whole export.
+    for *_, attrs in H.edges(data=True):
+        for key, val in list(attrs.items()):
+            attrs[key] = _graphml_safe(val)
 
     # Write atomically: a mid-serialization error otherwise leaves a 0-byte
     # .graphml on disk that downstream tooling mistakes for a completed export
